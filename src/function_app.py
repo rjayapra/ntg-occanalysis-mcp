@@ -1,8 +1,10 @@
 import json
 import logging
 import os
+import re
 from threading import Lock
-from typing import Optional
+from typing import Optional, Tuple
+from urllib.parse import unquote
 
 import azure.functions as func
 from azure.storage.blob import BlobServiceClient
@@ -94,7 +96,6 @@ class OccupationDataCache:
             
             try:
                 container_client = blob_client.get_container_client("occupation")
-                
                 # List and load all blobs (up to 20 files)
                 file_count = 0
                 for blob in container_client.list_blobs():
@@ -384,23 +385,18 @@ def list_all_occupations(context) -> str:
     logging.info("Retrieved all occupations")
     return occupations_content
 
-@app.generic_trigger(
-    arg_name="context",
-    type="mcpToolTrigger",
-    toolName="get_all_ranks",
-    description="Get a list of all unique ranks in the occupation data.",
-    toolProperties=tool_properties_get_all_ranks_json,
-)
-def get_all_ranks(context) -> str:
+
+def _get_all_ranks_impl(occupation_name: str = "") -> str:
     """
-    Get a list of all unique ranks in the occupation data.
+    Implementation for getting all unique ranks in the occupation data.
+    Shared between HTTP and MCP tool triggers.
     
     Args:
-        occupation: Optional occupation name to filter by. If not provided, returns ranks from all occupations.
-    """
-    content = json.loads(context)
-    occupation_name = content["arguments"].get(_OCC_NAME_PROPERTY_NAME, "")
+        occupation_name: Optional occupation name to filter by.
     
+    Returns:
+        JSON string containing the list of ranks.
+    """
     # Get occupation data from cache
     occupations_content = occupation_cache.get_occupation_data(occupation_name if occupation_name else None)
     data = json.loads(occupations_content)
@@ -430,25 +426,133 @@ def get_all_ranks(context) -> str:
     return json.dumps(result, indent=2)
 
 
+@app.route(route="ranks", methods=["GET"])
+def get_all_ranks_http(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    HTTP endpoint to get a list of all unique ranks in the occupation data.
+    
+    Query Parameters:
+        occupation: Optional occupation name to filter by.
+    
+    Returns:
+        HttpResponse: JSON response containing the list of ranks.
+    """
+    # Get optional occupation filter from query params
+    raw_occupation = req.params.get(_OCC_NAME_PROPERTY_NAME, "")
+    occupation_name = ""
+    
+    if raw_occupation:
+        occupation_name, error = _validate_and_sanitize_input(raw_occupation, "Occupation")
+        if error:
+            return func.HttpResponse(
+                json.dumps({"error": error}),
+                mimetype="application/json",
+                status_code=400
+            )
+    
+    result = _get_all_ranks_impl(occupation_name)
+    
+    # Check if the result contains an error (occupation not found)
+    result_data = json.loads(result)
+    if isinstance(result_data, dict) and "error" in result_data:
+        return func.HttpResponse(
+            result,
+            mimetype="application/json",
+            status_code=404
+        )
+    
+    return func.HttpResponse(
+        result,
+        mimetype="application/json",
+        status_code=200
+    )
+
+
+# ============================================================================
+# Input Validation and Sanitization
+# ============================================================================
+_MAX_INPUT_LENGTH = 100
+_VALID_INPUT_PATTERN = re.compile(r'^[a-zA-Z0-9\s\-_\.\(\)]+$')
+
+def _validate_and_sanitize_input(raw_input: str, field_name: str = "Input") -> Tuple[Optional[str], Optional[str]]:
+    """
+    Validate and sanitize a string input from HTTP requests.
+    
+    Args:
+        raw_input: The raw input string from the request.
+        field_name: The name of the field for error messages.
+        
+    Returns:
+        Tuple of (sanitized_value, error_message).
+        If valid, returns (sanitized_value, None).
+        If invalid, returns (None, error_message).
+    """
+    if not raw_input:
+        return None, f"{field_name} is required"
+    
+    # URL decode
+    try:
+        decoded = unquote(raw_input)
+    except Exception as e:
+        logging.warning(f"Failed to URL decode {field_name}: {e}")
+        return None, "Invalid URL encoding"
+    
+    # Strip whitespace
+    decoded = decoded.strip()
+    
+    if not decoded:
+        return None, f"{field_name} cannot be empty"
+    
+    # Check length limit to prevent DoS
+    if len(decoded) > _MAX_INPUT_LENGTH:
+        logging.warning(f"{field_name} too long: {len(decoded)} characters")
+        return None, f"{field_name} exceeds maximum length of {_MAX_INPUT_LENGTH} characters"
+    
+    # Validate against allowed character pattern (prevent injection attacks)
+    if not _VALID_INPUT_PATTERN.match(decoded):
+        logging.warning(f"Invalid characters in {field_name}: {repr(decoded)}")
+        return None, f"{field_name} contains invalid characters. Only alphanumeric characters, spaces, hyphens, underscores, periods, and parentheses are allowed."
+    
+    # Check for path traversal attempts
+    if '..' in decoded or '/' in decoded or '\\' in decoded:
+        logging.warning(f"Potential path traversal attempt in {field_name}: {repr(decoded)}")
+        return None, f"Invalid {field_name}"
+    
+    return decoded, None
+
+
 @app.generic_trigger(
     arg_name="context",
     type="mcpToolTrigger",
-    toolName="get_job_codes_for_rank",
-    description="Get job codes for a specific rank in an occupation.",
-    toolProperties=tool_properties_get_job_codes_for_rank_json,
+    toolName="get_all_ranks",
+    description="Get a list of all unique ranks in the occupation data.",
+    toolProperties=tool_properties_get_all_ranks_json,
 )
-def get_job_codes_for_rank(context) -> str:
+def get_all_ranks(context) -> str:
     """
-    Get job codes for a specific rank in an occupation.
+    Get a list of all unique ranks in the occupation data.
+    
+    Args:
+        occupation: Optional occupation name to filter by. If not provided, returns ranks from all occupations.
+    """
+    content = json.loads(context)
+    occupation_name = content["arguments"].get(_OCC_NAME_PROPERTY_NAME, "")
+    
+    return _get_all_ranks_impl(occupation_name)
+
+
+def _get_job_codes_for_rank_impl(rank: str, occupation_name: str = "") -> str:
+    """
+    Implementation for getting job codes for a specific rank.
+    Shared between HTTP and MCP tool triggers.
     
     Args:
         rank: The rank to filter by.
-        occupation: Optional occupation name to filter by.
-    """
-    content = json.loads(context)
-    rank = content["arguments"].get(_RANK_CODE_PROPERTY_NAME, "")
-    occupation_name = content["arguments"].get(_OCC_NAME_PROPERTY_NAME, "")
+        occupation_name: Optional occupation name to filter by.
     
+    Returns:
+        JSON string containing the list of job codes.
+    """
     if not rank:
         return json.dumps({"error": "Rank is required"}, indent=2)
     
@@ -488,6 +592,89 @@ def get_job_codes_for_rank(context) -> str:
         "job_codes": list(job_codes.values())
     }
     return json.dumps(result, indent=2)
+
+
+@app.route(route="job-codes", methods=["GET"])
+def get_job_codes_for_rank_http(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    HTTP endpoint to get job codes for a specific rank.
+    
+    Query Parameters:
+        rank: Required. The rank to get job codes for.
+        occupation: Optional occupation name to filter by.
+    
+    Returns:
+        HttpResponse: JSON response containing the list of job codes for the rank.
+    """
+    # Get required rank from query params
+    raw_rank = req.params.get(_RANK_CODE_PROPERTY_NAME, "")
+    if not raw_rank:
+        return func.HttpResponse(
+            json.dumps({"error": "Rank query parameter is required"}),
+            mimetype="application/json",
+            status_code=400
+        )
+    
+    # Validate and sanitize rank input
+    rank, error = _validate_and_sanitize_input(raw_rank, "Rank")
+    if error:
+        return func.HttpResponse(
+            json.dumps({"error": error}),
+            mimetype="application/json",
+            status_code=400
+        )
+    
+    # Get optional occupation filter from query params
+    raw_occupation = req.params.get(_OCC_NAME_PROPERTY_NAME, "")
+    occupation_name = ""
+    if raw_occupation:
+        occupation_name, error = _validate_and_sanitize_input(raw_occupation, "Occupation")
+        if error:
+            return func.HttpResponse(
+                json.dumps({"error": error}),
+                mimetype="application/json",
+                status_code=400
+            )
+    
+    result = _get_job_codes_for_rank_impl(rank, occupation_name)
+    
+    # Check if the result contains an error
+    result_data = json.loads(result)
+    if isinstance(result_data, dict) and "error" in result_data:
+        status_code = 404 if "not found" in result_data.get("error", "").lower() else 400
+        return func.HttpResponse(
+            result,
+            mimetype="application/json",
+            status_code=status_code
+        )
+    
+    return func.HttpResponse(
+        result,
+        mimetype="application/json",
+        status_code=200
+    )
+
+
+@app.generic_trigger(
+    arg_name="context",
+    type="mcpToolTrigger",
+    toolName="get_job_codes_for_rank",
+    description="Get job codes for a specific rank in an occupation.",
+    toolProperties=tool_properties_get_job_codes_for_rank_json,
+)
+def get_job_codes_for_rank(context) -> str:
+    """
+    Get job codes for a specific rank in an occupation.
+    
+    Args:
+        rank: The rank to filter by.
+        occupation: Optional occupation name to filter by.
+    """
+    content = json.loads(context)
+    rank = content["arguments"].get(_RANK_CODE_PROPERTY_NAME, "")
+    occupation_name = content["arguments"].get(_OCC_NAME_PROPERTY_NAME, "")
+    
+    return _get_job_codes_for_rank_impl(rank, occupation_name)
 
 
 @app.generic_trigger(
